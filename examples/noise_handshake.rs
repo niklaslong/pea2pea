@@ -239,7 +239,7 @@ impl Writing for SecureNode {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_target(false).init();
 
     let initiator = SecureNode::new("initiator").await.unwrap();
     let responder = SecureNode::new("responder").await.unwrap();

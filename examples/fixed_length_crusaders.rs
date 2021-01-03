@@ -115,7 +115,7 @@ impl Writing for JoJoNode {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_target(false).init();
 
     let config = NodeConfig {
         name: Some("Jotaro".into()),

@@ -228,7 +228,7 @@ impl Writing for Player {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_target(false).init();
 
     const GAME_TIME_SECS: u64 = 5;
     const NUM_PLAYERS: usize = 10;
