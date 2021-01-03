@@ -2,10 +2,11 @@ use crate::{connections::ConnectionWriter, protocols::ReturnableConnection, Pea2
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
+use futures::future::FutureExt;
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::*;
 
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, time::Duration};
 
 /// Can be used to specify and enable writing, i.e. sending outbound messages.
 /// If handshaking is enabled too, it goes into force only after the handshake has been concluded.
@@ -44,22 +45,41 @@ where
 
                         loop {
                             // TODO: when try_recv is available in tokio again (https://github.com/tokio-rs/tokio/issues/3350),
-                            // use try_recv() in order to write to the stream less often
-                            if let Some(msg) = outbound_message_receiver.recv().await {
-                                match writer_clone.write_to_stream(&msg, &mut conn_writer).await {
-                                    Ok(len) => {
-                                        node.known_peers().register_sent_message(addr, len);
-                                        node.stats.register_sent_message(len);
-                                        trace!(parent: node.span(), "sent {}B to {}", len, addr);
-                                    }
-                                    Err(e) => {
-                                        node.known_peers().register_failure(addr);
-                                        error!(parent: node.span(), "couldn't send a message to {}: {}", addr, e);
+                            // use try_recv() instead
+                            match outbound_message_receiver.recv().now_or_never() {
+                                Some(Some(msg)) => {
+                                    match writer_clone.write_to_stream(&msg, &mut conn_writer).await
+                                    {
+                                        Ok((written, msg_len)) => {
+                                            if written != 0 {
+                                                trace!(parent: node.span(), "sent {}B to {}", written, addr);
+                                            }
+                                            node.known_peers().register_sent_message(addr, msg_len);
+                                            node.stats.register_sent_message(msg_len);
+                                        }
+                                        Err(e) => {
+                                            node.known_peers().register_failure(addr);
+                                            error!(parent: node.span(), "couldn't send a message to {}: {}", addr, e);
+                                        }
                                     }
                                 }
-                            } else {
-                                panic!("can't receive messages sent to {}", addr);
-                                // can't recover
+                                None => {
+                                    if conn_writer.carry != 0 {
+                                        if let Err(e) = conn_writer
+                                            .writer
+                                            .write_all(&conn_writer.buffer[..conn_writer.carry])
+                                            .await
+                                        {
+                                            node.known_peers().register_failure(addr);
+                                            error!(parent: node.span(), "couldn't send a message to {}: {}", addr, e);
+                                        }
+                                        trace!(parent: node.span(), "sent {}B to {}", conn_writer.carry, addr);
+                                        conn_writer.carry = 0;
+                                    }
+                                    // introduce a delay in order not to block
+                                    sleep(Duration::from_millis(1)).await;
+                                }
+                                Some(None) => panic!("can't receive messages sent to {}", addr), // can't recover
                             }
                         }
                     });
@@ -83,24 +103,42 @@ where
             .set_writing_handler((conn_sender, writing_task).into());
     }
 
-    /// Writes the given message to `ConnectionWriter`'s stream; returns the number of bytes written.
+    /// Writes the given message to `ConnectionWriter`'s stream; returns the number of bytes written paired
+    /// with the number of bytes of the whole message.
     async fn write_to_stream(
         &self,
         message: &[u8],
         conn_writer: &mut ConnectionWriter,
-    ) -> io::Result<usize> {
+    ) -> io::Result<(usize, usize)> {
         let ConnectionWriter {
             node: _,
             addr,
             writer,
             buffer,
-            carry: _,
+            carry,
         } = conn_writer;
 
-        let len = self.write_message(*addr, message, buffer)?;
-        writer.write_all(&buffer[..len]).await?;
+        let len = self.write_message(*addr, message, &mut buffer[*carry..])?;
 
-        Ok(len)
+        let (written, len) = if len != 0 {
+            let written = writer.write(&buffer[..*carry + len]).await?;
+            *carry = *carry + len - written;
+
+            // move the leftover bytes to the beginning of the buffer; the next read will append bytes
+            // starting from where the leftover ones end, allowing the message to be completed
+            buffer.copy_within(written..written + *carry, 0);
+
+            (written, len)
+        } else {
+            writer.write_all(&buffer[..*carry]).await?;
+            let written = *carry;
+            let len = self.write_message(*addr, message, buffer)?;
+            *carry = len;
+
+            (written, len)
+        };
+
+        Ok((written, len))
     }
 
     /// Writes the provided payload to `ConnectionWriter`'s buffer; the payload can get prepended with a header

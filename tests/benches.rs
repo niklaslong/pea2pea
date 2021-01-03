@@ -19,9 +19,13 @@ impl Pea2Pea for Spammer {
 
 impl Writing for Spammer {
     fn write_message(&self, _: SocketAddr, payload: &[u8], buffer: &mut [u8]) -> io::Result<usize> {
-        buffer[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        buffer[4..][..payload.len()].copy_from_slice(&payload);
-        Ok(4 + payload.len())
+        if buffer.len() >= 4 + payload.len() {
+            buffer[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            buffer[4..][..payload.len()].copy_from_slice(&payload);
+            Ok(4 + payload.len())
+        } else {
+            Ok(0)
+        }
     }
 }
 
